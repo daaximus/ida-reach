@@ -5,10 +5,22 @@ param(
     [Parameter(Position=1)]
     [string]$out_dir = ".",
     
-    [switch]$skip_pdb
+    [switch]$skip_pdb,
+    
+    [ValidateSet("all", "x64", "x86", "arm64")]
+    [string]$arch = "all"
 )
 
 $ErrorActionPreference = "Stop"
+
+function get_arch([int]$machine_type) {
+    switch ($machine_type) {
+        0x8664 { return "x64" }
+        0xAA64 { return "arm64" }
+        0x14C  { return "x86" }
+        default { return "unknown" }
+    }
+}
 
 function get_pdb_info([string]$pe_path) {
     try {
@@ -114,7 +126,7 @@ function get_pdb_info([string]$pe_path) {
     }
 }
 
-function download_pdb([string]$pe_path, [string]$dest_dir) {
+function download_pdb([string]$pe_path, [string]$dest_dir, [string]$ts_hex) {
     $pdb = get_pdb_info $pe_path
     if (-not $pdb) { return $false }
     
@@ -125,7 +137,7 @@ function download_pdb([string]$pe_path, [string]$dest_dir) {
     
     try {
         Invoke-WebRequest -Uri $pdb_url -OutFile $pdb_dst -UseBasicParsing -EA Stop
-        Write-Host "      pdb: $($pdb.name)"
+        Write-Host "      pdb: $([IO.Path]::GetFileName($pdb_dst))"
         return $true
     } catch {
         Remove-Item $pdb_dst -Force -EA SilentlyContinue
@@ -133,48 +145,90 @@ function download_pdb([string]$pe_path, [string]$dest_dir) {
     }
 }
 
+function get_version_folder($entry) {
+    $info = $entry.fileInfo
+    $wv = $entry.windowsVersions
+    
+    if ($info.version) {
+        return ($info.version -split ' ')[0]
+    }
+    
+    if ($wv.builds) {
+        $first_build = @($wv.builds.PSObject.Properties)[0]
+        if ($first_build.Value.updateInfo.build) {
+            return $first_build.Value.updateInfo.build
+        }
+    }
+    
+    return "unknown_$($info.timestamp)"
+}
+
 $base = [IO.Path]::GetFileNameWithoutExtension($file)
 $ver_dir = Join-Path $out_dir "${base}_versions"
 
 Write-Host "target: $file"
 Write-Host "output: $ver_dir"
+Write-Host "arch filter: $arch"
 if (-not (Test-Path $ver_dir)) {
     New-Item -ItemType Directory -Path $ver_dir -Force | Out-Null
 }
 
-$url = "https://github.com/m417z/winbindex/raw/gh-pages/data/by_filename_compressed/$file.json.gz"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$url_main = "https://github.com/m417z/winbindex/raw/gh-pages/data/by_filename_compressed/$file.json.gz"
+$url_insider = "https://m417z.com/winbindex-data-insider/by_filename_compressed/$file.json.gz"
+
 $gz_tmp = Join-Path $env:TEMP "$file.json.gz"
 $json_tmp = Join-Path $env:TEMP "$file.json"
 
-try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $url -OutFile $gz_tmp -UseBasicParsing
-} catch {
-    Write-Error "download failed for '$file'"
-    exit 1
+function fetch_and_decompress([string]$url, [string]$gz_path, [string]$json_path) {
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $gz_path -UseBasicParsing
+        $gz = New-Object IO.FileStream($gz_path, [IO.FileMode]::Open, [IO.FileAccess]::Read)
+        $decomp = New-Object IO.Compression.GzipStream($gz, [IO.Compression.CompressionMode]::Decompress)
+        $out = New-Object IO.FileStream($json_path, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+        $decomp.CopyTo($out)
+        $out.Close(); $decomp.Close(); $gz.Close()
+        $data = (Get-Content $json_path -Raw) | ConvertFrom-Json
+        Remove-Item $gz_path, $json_path -Force -EA SilentlyContinue
+        return $data
+    } catch {
+        Remove-Item $gz_path, $json_path -Force -EA SilentlyContinue
+        return $null
+    }
 }
 
-try {
-    $gz = New-Object IO.FileStream($gz_tmp, [IO.FileMode]::Open, [IO.FileAccess]::Read)
-    $decomp = New-Object IO.Compression.GzipStream($gz, [IO.Compression.CompressionMode]::Decompress)
-    $out = New-Object IO.FileStream($json_tmp, [IO.FileMode]::Create, [IO.FileAccess]::Write)
-    $decomp.CopyTo($out)
-    $out.Close(); $decomp.Close(); $gz.Close()
-} catch {
-    Write-Error "decompress failed: $_"
+$meta_main = fetch_and_decompress $url_main $gz_tmp $json_tmp
+if (-not $meta_main) {
+    Write-Error "download failed for '$file' from main winbindex"
     exit 1
 }
+$meta_insider = fetch_and_decompress $url_insider $gz_tmp $json_tmp
+if ($meta_insider) {
+    Write-Host "  insider data found"
+} else {
+    Write-Host "  no insider data"
+}
 
-$meta = (Get-Content $json_tmp -Raw) | ConvertFrom-Json
-Remove-Item $gz_tmp, $json_tmp -Force -EA SilentlyContinue
+$merged = @{}
+foreach ($e in $meta_main.PSObject.Properties) {
+    $merged[$e.Name] = $e.Value
+}
+if ($meta_insider) {
+    foreach ($e in $meta_insider.PSObject.Properties) {
+        if (-not $merged.ContainsKey($e.Name)) {
+            $merged[$e.Name] = $e.Value
+        }
+    }
+}
 
-$entries = $meta.PSObject.Properties
-$total = @($entries).Count
+$entries = $merged.GetEnumerator()
+$total = $merged.Count
 Write-Host "found $total versions"
 
 $cache = @{}
 $pdb_cache = @{}
-$ok = 0; $skip = 0; $fail = 0; $pdb_ok = 0; $n = 0
+$ok = 0; $skip = 0; $fail = 0; $ignored = 0; $pdb_ok = 0; $n = 0
 
 foreach ($e in $entries) {
     $n++
@@ -187,7 +241,13 @@ foreach ($e in $entries) {
     $vs = $info.virtualSize
     if (-not $ts -or -not $vs) { continue }
     
-    $ver = if ($info.version) { ($info.version -split ' ')[0] } else { "unknown" }
+    $bin_arch = get_arch $info.machineType
+    if ($arch -ne "all" -and $bin_arch -ne $arch) {
+        $ignored++
+        continue
+    }
+    
+    $ver = get_version_folder $v
     $ts_hex = "{0:X8}" -f [int64]$ts
     $vs_hex = "{0:X}" -f [int64]$vs
     $sym_url = "https://msdl.microsoft.com/download/symbols/$file/$ts_hex$vs_hex/$file"
@@ -199,77 +259,68 @@ foreach ($e in $entries) {
     if ($win_vers.Count -eq 0) { continue }
     
     $key = "${ts}_${vs}"
-    
-    foreach ($wv in $win_vers) {
-        $sub = Join-Path $ver_dir "Windows_$wv" | Join-Path -ChildPath $ver
-        $dst = Join-Path $sub $file
-        
-        if (Test-Path $dst) {
-            Write-Host "[$n/$total] exists: $dst"
-            $skip++
 
-            if (-not $skip_pdb -and -not $pdb_cache.ContainsKey($key)) {
-                if (download_pdb $dst $sub) { $pdb_ok++; $pdb_cache[$key] = $true }
-            }
-            continue
-        }
+    # version/timestamp_arch/og_name.ext
+    $sub = Join-Path $ver_dir $ver | Join-Path -ChildPath "${ts_hex}_${bin_arch}"
+    $base_name = [IO.Path]::GetFileNameWithoutExtension($file)
+    $ext = [IO.Path]::GetExtension($file)
+    $dst = Join-Path $sub $file
         
-        if (-not (Test-Path $sub)) {
-            New-Item -ItemType Directory -Path $sub -Force | Out-Null
+    if (Test-Path $dst) {
+        Write-Host "[$n/$total] exists: $dst"
+        $skip++
+
+        if (-not $skip_pdb -and -not $pdb_cache.ContainsKey($key)) {
+            if (download_pdb $dst $sub $ts_hex) { $pdb_ok++; $pdb_cache[$key] = $true }
         }
+        continue
+    }
+
+    if (-not (Test-Path $sub)) {
+        New-Item -ItemType Directory -Path $sub -Force | Out-Null
+    }
+
+    if ($cache.ContainsKey($key)) {
+        Write-Host "[$n/$total] cache: $dst"
+        Copy-Item $cache[$key].bin $dst -Force
+        if ($cache[$key].pdb -and (Test-Path $cache[$key].pdb)) {
+            Copy-Item $cache[$key].pdb (Join-Path $sub ([IO.Path]::GetFileName($cache[$key].pdb))) -Force
+        }
+        $ok++
+        continue
+    }
         
-        if ($cache.ContainsKey($key)) {
-            Write-Host "[$n/$total] cache: $dst"
-            Copy-Item $cache[$key].bin $dst -Force
-            if ($cache[$key].pdb -and (Test-Path $cache[$key].pdb)) {
-                $pdb_name = [IO.Path]::GetFileName($cache[$key].pdb)
-                Copy-Item $cache[$key].pdb (Join-Path $sub $pdb_name) -Force
-            }
+    Write-Host "[$n/$total] get: $sym_url -> $bin_arch"
+    $retry = 0; $max_retry = 3; $got = $false
+        
+    while ($retry -lt $max_retry -and -not $got) {
+        try {
+            Invoke-WebRequest -Uri $sym_url -OutFile $dst -UseBasicParsing
+            $got = $true
+            $cache[$key] = @{ bin = $dst; pdb = $null }
             $ok++
-            continue
-        }
-        
-        Write-Host "[$n/$total] get: $sym_url"
-        $retry = 0; $max_retry = 3; $got = $false
-        
-        while ($retry -lt $max_retry -and -not $got) {
-            try {
-                Invoke-WebRequest -Uri $sym_url -OutFile $dst -UseBasicParsing
-                $got = $true
-                $cache[$key] = @{ bin = $dst; pdb = $null }
-                $ok++
-                
-                if (-not $skip_pdb) {
-                    $pdb_info = get_pdb_info $dst
-                    if ($pdb_info) {
-                        $pdb_dst = Join-Path $sub $pdb_info.name
-                        $pdb_url = "https://msdl.microsoft.com/download/symbols/$($pdb_info.name)/$($pdb_info.sig)/$($pdb_info.name)"
-                        try {
-                            Invoke-WebRequest -Uri $pdb_url -OutFile $pdb_dst -UseBasicParsing -EA Stop
-                            Write-Host "      pdb: $($pdb_info.name)"
-                            $cache[$key].pdb = $pdb_dst
-                            $pdb_ok++
-                        } catch {
-                            Remove-Item $pdb_dst -Force -EA SilentlyContinue
-                        }
-                    }
+
+            if (-not $skip_pdb) {
+                if (download_pdb $dst $sub $ts_hex) {
+                    $pdb_ok++
+                    $pdb_cache[$key] = $true
                 }
-            } catch {
-                $retry++
-                if ($retry -lt $max_retry) {
-                    Write-Host "  retry $retry/$max_retry..."
-                    Start-Sleep -Seconds 2
-                } else {
-                    Write-Warning "failed: $sym_url ($_)"
-                    Remove-Item $dst -Force -EA SilentlyContinue
-                    $fail++
-                }
+            }
+        } catch {
+            $retry++
+            if ($retry -lt $max_retry) {
+                Write-Host "  retry $retry/$max_retry..."
+                Start-Sleep -Seconds 2
+            } else {
+                Write-Warning "failed: $sym_url ($_)"
+                Remove-Item $dst -Force -EA SilentlyContinue
+                $fail++
             }
         }
     }
 }
 
 Write-Host ""
-Write-Host "binaries - ok: $ok; skip: $skip; fail: $fail"
+Write-Host "binaries - ok: $ok; skip: $skip; fail: $fail; ignored: $ignored"
 Write-Host "pdbs: $pdb_ok"
 Write-Host "dir: $ver_dir"
